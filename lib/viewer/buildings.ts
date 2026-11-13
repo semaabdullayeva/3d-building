@@ -1,12 +1,14 @@
 import * as THREE from "three";
-import type { FloorData, GrassData, Polygon, Podium, SiteBlock, UnitData, WindowType } from "../types";
+import type { FloorData, Polygon, Podium, SiteBlock, UnitData, WindowType } from "../types";
 import {
   distToOutline,
   extrudePolygon,
   facadeBox,
+  facadeBoxMatrix,
   FacadeBay,
   forEachFacadeBay,
   inflate,
+  instancedBoxes,
   matte,
   mergedMesh,
   mulberry32,
@@ -15,7 +17,9 @@ import {
   symmetricBox,
 } from "./geometry";
 import { buildWindow, placeWindows } from "./windows";
-import type { GrassTuft, Vegetation } from "./vegetation";
+import type { Vegetation } from "./vegetation";
+import { grassMaterial, worldUV } from "./ground";
+import { glassMaterial, surface } from "./surfaces";
 
 export const PALETTE = {
   wall: 0xb57850,
@@ -51,7 +55,8 @@ export interface Unit {
   block: Block;
   mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
   edges: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>;
-  glass: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial> | null;
+  /** this apartment's panes: a range of instances in the floor's pane mesh (tinted by instance colour) */
+  glass: { mesh: THREE.InstancedMesh; start: number; count: number } | null;
   isTop: boolean;
   pending: boolean;
 }
@@ -64,21 +69,26 @@ export interface Block {
   group: THREE.Group;
   units: Unit[];
   /** Per floor: its group and the non-unit meshes (slab, core, fins…) that fade with it. */
-  floorGroups: Map<number, { group: THREE.Group; slabs: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>[] }>;
+  floorGroups: Map<number, { group: THREE.Group; slabs: FadeMesh[] }>;
   /** Frame / roof meshes hidden when a single floor is isolated. */
   shell: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>[];
   center: THREE.Vector3;
   windows?: { floor: number; unit: string; x: number; y: number; ux: number; uy: number; w: number }[];
+  /** instance counts, for debugging */
+  paneCount: number;
+  barCount: number;
 }
 
 type StdMesh = THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
+/** anything that fades with its floor: merged meshes and the instanced panes / frame bars */
+export type FadeMesh = StdMesh | THREE.InstancedMesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
 
 function createMaterials() {
   return {
-    slab: new THREE.MeshStandardMaterial({ color: PALETTE.stone, roughness: 0.85, transparent: true }),
-    core: new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.9, transparent: true }),
+    slab: surface(new THREE.MeshStandardMaterial({ color: PALETTE.stone, transparent: true }), "concrete"),
+    core: surface(new THREE.MeshStandardMaterial({ color: 0xd8d4cc, transparent: true }), "concrete"),
     fin: new THREE.MeshStandardMaterial({ color: PALETTE.fin, roughness: 0.75, transparent: true }),
-    shell: new THREE.MeshStandardMaterial({ color: PALETTE.stone, roughness: 0.85, transparent: true }),
+    shell: surface(new THREE.MeshStandardMaterial({ color: PALETTE.stone, transparent: true }), "concrete"),
     edges: new THREE.LineBasicMaterial({ color: 0x4a3324, transparent: true, opacity: 0.35 }),
     balconyGlass: new THREE.MeshStandardMaterial({ color: 0xe9eef2, roughness: 0.3, transparent: true, opacity: 0.45 }),
     rail: new THREE.MeshStandardMaterial({ color: 0xf3f1ec, roughness: 0.6, transparent: true }),
@@ -98,6 +108,7 @@ const ccw = (p: Polygon) => (signedArea(p) > 0 ? p : p.slice().reverse());
 export function buildTower(
   site: SiteBlock,
   windowTypes: Record<string, WindowType>,
+  env: THREE.Texture | null = null,
   materials = createMaterials(),
 ): { block: Block; units: Unit[] } {
   const d = site.data;
@@ -113,6 +124,8 @@ export function buildTower(
     floorGroups: new Map(),
     shell: [],
     center: new THREE.Vector3(px, 27, -py),
+    paneCount: 0,
+    barCount: 0,
   };
   const generic = d.shape === "generic";
   const topFrom = generic ? d.floorsTotal - 2 : TIP1_TOP_FLOOR;
@@ -205,7 +218,7 @@ export function buildTower(
       shadowed(
         new THREE.Mesh(
           extrudePolygon(outline, pd.level + 0.3, ph - 0.9),
-          new THREE.MeshStandardMaterial({ color: PALETTE.podiumGlass, roughness: 0.3, metalness: 0.1 }),
+          glassMaterial(env, { color: PALETTE.podiumGlass }),
         ),
       ),
     );
@@ -266,7 +279,7 @@ export function buildTower(
         }
       }
     });
-    const stoneMat = new THREE.MeshStandardMaterial({ color: PALETTE.podiumStone, roughness: 0.9 });
+    const stoneMat = surface(new THREE.MeshStandardMaterial({ color: PALETTE.podiumStone }), "concrete");
     group.add(shadowed(mergedMesh(stone, stoneMat)));
     const mull = mergedMesh(mullions, new THREE.MeshStandardMaterial({ color: 0xc4b8a6, roughness: 1 }));
     if (mull) group.add(mull);
@@ -281,7 +294,7 @@ export function buildTower(
   const units: Unit[] = [];
   for (const fl of d.floors) {
     const fg = new THREE.Group();
-    const slabs: StdMesh[] = [];
+    const slabs: FadeMesh[] = [];
     const isTop = fl.floor >= topFrom;
     const wallH = fl.height - SLAB_THICKNESS;
     const base = fl.level + SLAB_THICKNESS;
@@ -300,18 +313,21 @@ export function buildTower(
 
     const occluders = fl.units.map((u) => u.polygon).concat(cores);
     const fins: THREE.BufferGeometry[] = [];
-    const frames: THREE.BufferGeometry[] = [];
+    // window panes and frame bars of the whole floor are instances of one unit box
+    const frames: THREE.Matrix4[] = [];
+    const panes: THREE.Matrix4[] = [];
+    const paneOwners: { unit: Unit; start: number; count: number }[] = [];
     const windows = fl.openings && fl.openings.length ? placeWindows(fl, occluders, windowTypes) : null;
 
     for (const ud of fl.units) {
       const geo = extrudePolygon(ud.polygon, base, wallH);
       const mesh = shadowed(
-        new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: PALETTE.wall, roughness: 0.8, transparent: true })),
+        new THREE.Mesh(geo, surface(new THREE.MeshStandardMaterial({ color: PALETTE.wall, transparent: true }), "cladding")),
       );
       const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), materials.edges.clone());
       mesh.add(edges);
 
-      const glass: THREE.BufferGeometry[] = [];
+      const glass: THREE.Matrix4[] = [];
       const glassH = isTop ? wallH * 0.84 : wallH * 0.72;
       if (windows) {
         for (const w of windows.get(ud)) {
@@ -325,19 +341,15 @@ export function buildTower(
           occluders.filter((p) => p !== ud.polygon),
           1.15,
           (b) => {
-            if (b.w > 0.7) glass.push(facadeBox(b.cx, b.cy, b.nx, b.ny, b.angle, b.w - 0.16, glassH, 0.08, base + wallH * 0.52, 0.03));
+            if (b.w > 0.7) glass.push(facadeBoxMatrix(b.cx, b.cy, b.nx, b.ny, b.angle, b.w - 0.16, glassH, 0.08, base + wallH * 0.52, 0.03));
             fins.push(facadeBox(b.sx, b.sy, b.nx, b.ny, b.angle, 0.14, wallH, 0.26, mid, 0.12));
             if (b.last) fins.push(facadeBox(b.ex, b.ey, b.nx, b.ny, b.angle, 0.14, wallH, 0.26, mid, 0.12));
           },
         );
       }
-      const glassMesh = mergedMesh(
-        glass,
-        new THREE.MeshStandardMaterial({ color: PALETTE.glass, roughness: 0.25, metalness: 0.1, transparent: true }),
-      ) as StdMesh | null;
-      if (glassMesh) mesh.add(glassMesh);
-
-      const unit: Unit = { data: ud, floor: fl, block, mesh, edges, glass: glassMesh, isTop, pending: !!ud.pending };
+      const unit: Unit = { data: ud, floor: fl, block, mesh, edges, glass: null, isTop, pending: !!ud.pending };
+      if (glass.length) paneOwners.push({ unit, start: panes.length, count: glass.length });
+      panes.push(...glass);
       mesh.userData.unit = unit;
       units.push(unit);
       block.units.push(unit);
@@ -350,10 +362,19 @@ export function buildTower(
       fg.add(finMesh);
       slabs.push(finMesh);
     }
-    const frameMesh = mergedMesh(frames, materials.windowFrame.clone()) as StdMesh | null;
-    if (frameMesh) {
+    if (panes.length) {
+      const paneMesh = instancedBoxes(panes, glassMaterial(env, { transparent: true }));
+      for (let i = 0; i < panes.length; i++) paneMesh.setColorAt(i, UNIT_COLORS.glass);
+      for (const o of paneOwners) o.unit.glass = { mesh: paneMesh, start: o.start, count: o.count };
+      fg.add(paneMesh);
+      slabs.push(paneMesh);
+      block.paneCount += panes.length;
+    }
+    if (frames.length) {
+      const frameMesh = instancedBoxes(frames, materials.windowFrame.clone());
       fg.add(frameMesh);
       slabs.push(frameMesh);
+      block.barCount += frames.length;
     }
 
     // balcony glass + handrail along open slab edges
@@ -451,14 +472,14 @@ export function buildTower(
   return { block, units };
 }
 
-export function buildTowers(blocks: SiteBlock[], windowTypes: Record<string, WindowType>) {
+export function buildTowers(blocks: SiteBlock[], windowTypes: Record<string, WindowType>, env: THREE.Texture | null = null) {
   const materials = createMaterials();
-  const all = blocks.map((b) => buildTower(b, windowTypes, materials));
+  const all = blocks.map((b) => buildTower(b, windowTypes, env, materials));
   return { blocks: all.map((r) => r.block), units: all.flatMap((r) => r.units) };
 }
 
 /** Low non-residential block between towers (or a flat paved deck when `flat`). */
-export function buildPodium(podium: Podium, neighbours: Polygon[]) {
+export function buildPodium(podium: Podium, neighbours: Polygon[], env: THREE.Texture | null = null) {
   const poly = podium.polygon;
   const h = podium.height;
   const group = new THREE.Group();
@@ -474,7 +495,7 @@ export function buildPodium(podium: Podium, neighbours: Polygon[]) {
     shadowed(
       new THREE.Mesh(
         extrudePolygon(poly, 0.3, h - 0.9),
-        new THREE.MeshStandardMaterial({ color: PALETTE.podiumGlass, roughness: 0.3, metalness: 0.1 }),
+        glassMaterial(env, { color: PALETTE.podiumGlass }),
       ),
     ),
   );
@@ -509,27 +530,27 @@ export function buildPodium(podium: Podium, neighbours: Polygon[]) {
       }
     }
   });
-  const stoneMat = new THREE.MeshStandardMaterial({ color: PALETTE.podiumStone, roughness: 0.9 });
+  const stoneMat = surface(new THREE.MeshStandardMaterial({ color: PALETTE.podiumStone }), "concrete");
   const stoneMesh = mergedMesh(stone, stoneMat);
   if (stoneMesh) group.add(shadowed(stoneMesh));
   const louverMesh = mergedMesh(louvers, new THREE.MeshStandardMaterial({ color: PALETTE.louver, roughness: 0.7 }));
   if (louverMesh) group.add(shadowed(louverMesh, true, false));
   group.add(shadowed(new THREE.Mesh(extrudePolygon(inflate(poly, 0.12), h - 0.6, 0.6), stoneMat)));
+  // plain roof deck, or a lawn with the shared grass texture
   const roof = new THREE.Mesh(
-    extrudePolygon(inflate(poly, -1), h, 0.06),
-    new THREE.MeshStandardMaterial({ color: podium.roof === "deck" ? PALETTE.roof : 0x86a86a, roughness: 1 }),
+    worldUV(extrudePolygon(inflate(poly, -1), h, 0.06)),
+    podium.roof === "deck" ? new THREE.MeshStandardMaterial({ color: PALETTE.roof, roughness: 1 }) : grassMaterial(),
   );
   roof.receiveShadow = true;
   group.add(roof);
   return group;
 }
 
-/** Tree clusters and grass on the green podium roofs. */
+/** Tree clusters on the green podium roofs (the lawn itself is the roof surface of buildPodium). */
 export function buildRoofGardens(
   scene: THREE.Object3D,
   podiums: Podium[],
   towerOutlines: Polygon[],
-  grass: GrassData | undefined,
   veg: Vegetation,
 ) {
   const rand = mulberry32(20261111);
@@ -570,22 +591,6 @@ export function buildRoofGardens(
       }
     }
   }
-
-  const tufts: GrassTuft[] = [];
-  for (const pd of green) {
-    const xs = pd.polygon.map((p) => p[0]);
-    const ys = pd.polygon.map((p) => p[1]);
-    const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-    const target = Math.round((area(pd.polygon) / 1.1) * veg.grassDensity);
-    for (let placed = 0, tries = 0; placed < target && tries < target * 6; tries++) {
-      const x = x0 + rand() * (x1 - x0);
-      const y = y0 + rand() * (y1 - y0);
-      if (!pointInPolygon(x, y, pd.polygon) || distToOutline(x, y, pd.polygon) < 1.7) continue;
-      placed++;
-      tufts.push({ x, y, h: pd.height + 0.06, k: 0.8 + rand() * 0.6, tint: rand() });
-    }
-  }
-  veg.stats.grassTufts = veg.addGrass(scene, grass, tufts);
 
   veg.addTrees(
     scene,

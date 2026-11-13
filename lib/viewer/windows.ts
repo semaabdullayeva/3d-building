@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { FloorData, Polygon, UnitData, WindowType } from "../types";
-import { facadeBox, pointInPolygon, signedArea } from "./geometry";
+import { facadeBox, facadeBoxMatrix, pointInPolygon, signedArea } from "./geometry";
 
 const DEFAULT_WINDOW: WindowType = { w: 2, h: 2.7, panels: [1, 1], bar: 1, door: false };
 
@@ -102,13 +102,16 @@ export function placeWindows(floor: FloorData, occluders: Polygon[], types: Reco
   return result;
 }
 
-/** Glass pane, frame (with transom and mullions) and the two side fins of one window. */
+/**
+ * One window: instance matrices for the glass pane and the frame bars (transom, mullions),
+ * plus the geometry of the two side fins.
+ */
 export function buildWindow(
   win: WindowPlacement,
   base: number,
   wallHeight: number,
-  glass: THREE.BufferGeometry[],
-  frames: THREE.BufferGeometry[],
+  glass: THREE.Matrix4[],
+  frames: THREE.Matrix4[],
   fins: THREE.BufferGeometry[],
 ) {
   const h = Math.min(win.type.h, wallHeight - 0.05);
@@ -116,10 +119,10 @@ export function buildWindow(
   const along = (o: number) => [win.cx + win.ux * o, win.cy + win.uy * o];
   const frame = (o: number, w: number, y: number, fh: number) => {
     const [x, yy] = along(o);
-    frames.push(facadeBox(x, yy, win.nx, win.ny, win.angle, w, fh, 0.12, y, 0.07));
+    frames.push(facadeBoxMatrix(x, yy, win.nx, win.ny, win.angle, w, fh, 0.12, y, 0.07));
   };
 
-  glass.push(facadeBox(win.cx, win.cy, win.nx, win.ny, win.angle, win.w - bar, h - bar, 0.08, base + h / 2, 0.04));
+  glass.push(facadeBoxMatrix(win.cx, win.cy, win.nx, win.ny, win.angle, win.w - bar, h - bar, 0.08, base + h / 2, 0.04));
   frame(0, win.w, base + bar / 2, bar);
   frame(0, win.w, base + h - bar / 2, bar);
   frame(0, win.w, base + Math.min(win.type.bar, h - 0.3), bar);

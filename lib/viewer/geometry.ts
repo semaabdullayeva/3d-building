@@ -205,6 +205,37 @@ export function facadeBox(
   return g;
 }
 
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+
+/** Same placement as facadeBox(), but as a matrix for an instance of a unit box (see instancedBoxes). */
+export function facadeBoxMatrix(
+  px: number,
+  py: number,
+  nx: number,
+  ny: number,
+  angle: number,
+  along: number,
+  height: number,
+  depth: number,
+  yCenter: number,
+  out: number,
+) {
+  return new THREE.Matrix4().compose(
+    new THREE.Vector3(px + nx * out, yCenter, -(py + ny * out)),
+    new THREE.Quaternion().setFromAxisAngle(Y_AXIS, angle),
+    new THREE.Vector3(along, height, depth),
+  );
+}
+
+const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
+
+/** One InstancedMesh of unit boxes: window panes, frame bars… – one draw call for all of them. */
+export function instancedBoxes<M extends THREE.Material>(matrices: THREE.Matrix4[], material: M) {
+  const mesh = new THREE.InstancedMesh(UNIT_BOX, material, matrices.length);
+  matrices.forEach((m, i) => mesh.setMatrixAt(i, m));
+  return mesh;
+}
+
 export interface FacadeBay {
   cx: number;
   cy: number;
@@ -282,13 +313,13 @@ export function mergedMesh(geos: THREE.BufferGeometry[], material: THREE.Materia
 
 /** Like mergedMesh but converts indexed parts first and turns on shadows. */
 export function mergedStaticMesh(geos: THREE.BufferGeometry[], material: THREE.Material, castShadow = true) {
-  const mesh = new THREE.Mesh(
-    mergeGeometries(
-      geos.map((g) => (g.index ? g.toNonIndexed() : g)),
-      false,
-    ),
-    material,
-  );
+  // plain-coloured parts: keep only position and normal so that shapes from different sources can be merged
+  const parts = geos.map((g) => {
+    const n = g.index ? g.toNonIndexed() : g;
+    for (const k of Object.keys(n.attributes)) if (k !== "position" && k !== "normal") n.deleteAttribute(k);
+    return n;
+  });
+  const mesh = new THREE.Mesh(mergeGeometries(parts, false), material);
   if (castShadow) mesh.castShadow = true;
   mesh.receiveShadow = true;
   return mesh;

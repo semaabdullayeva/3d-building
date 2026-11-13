@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import type { GrassData, Point, Polygon } from "../types";
+import type { Point, Polygon } from "../types";
 import {
   convexHull,
   distToOutline,
@@ -14,7 +14,8 @@ import {
   ribbonGeometry,
   smoothPath,
 } from "./geometry";
-import type { GrassTuft, TreeInstance, Vegetation } from "./vegetation";
+import type { TreeInstance, Vegetation } from "./vegetation";
+import { grassMaterial, worldUV } from "./ground";
 
 type SiteTree = { x: number; y: number; kind: "round" | "cypress" | "bush" | "palm"; k: number; tint: number };
 
@@ -22,7 +23,7 @@ const TREE_HEIGHT = { round: 9, cypress: 10, bush: 1.7 };
 
 /**
  * Procedural surroundings of the complex: rolling terrain, ring road and access roads,
- * courtyard with lawns and a playground, street trees, distant grass and forest.
+ * asphalt courtyard with lawns, garden paths and a playground, street trees and forest.
  *
  * @param footprints   plan outlines of every building (towers + podiums)
  * @param towerCenters plan centre of each tower (paths lead from the playground to them)
@@ -31,7 +32,6 @@ export function buildLandscape(
   scene: THREE.Object3D,
   footprints: Polygon[],
   towerCenters: Point[],
-  grass: GrassData | undefined,
   veg: Vegetation,
 ) {
   const rand = mulberry32(7411);
@@ -116,12 +116,12 @@ export function buildLandscape(
       const h = terrainHeight(x, y);
       pos.setXYZ(i, x, h - 0.03, -y);
       const m = 0.5 + 0.5 * Math.sin(x * 0.031 + 0.4) * Math.sin(y * 0.027 + 1.9);
-      c.setHSL(0.24 + 0.05 * m, 0.33 + 0.1 * m, 0.36 + 0.1 * (1 - m) - Math.min(0.06, h * 0.001));
+      c.setHSL(0.2, 0.08, 0.92 - Math.min(0.1, h * 0.0014)); // light tint over the grass texture, darker on the hills
       colors.set([c.r, c.g, c.b], i * 3);
     }
     geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
     geo.computeVertexNormals();
-    const ground = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 }));
+    const ground = new THREE.Mesh(worldUV(geo), grassMaterial({ vertexColors: true, wild: 1 }));
     ground.receiveShadow = true;
     scene.add(ground);
   }
@@ -137,9 +137,13 @@ export function buildLandscape(
   const sidewalk = smoothPath(offsetPolygon(hull, courtMargin + 1.2 + roadWidth + 1.3), true);
   scene.add(mergedStaticMesh([ribbonGeometry(sidewalk.concat([sidewalk[0], sidewalk[1]]), 2.2, 0.16)], matte(0xcfccc4), false));
 
+  // light sidewalk rim around the complex; inside it the ground between the buildings is asphalt
   const pad = new THREE.Mesh(extrudePolygon(courtyard, 0, 0.3), matte(0xd8d3c8));
   pad.receiveShadow = true;
   scene.add(pad);
+  const yard = new THREE.Mesh(extrudePolygon(offsetPolygon(hull, 0.4), 0.3, 0.012), matte(0x55585d));
+  yard.receiveShadow = true;
+  scene.add(yard);
 
   // dashed centre lines
   {
@@ -175,39 +179,74 @@ export function buildLandscape(
   const plazaR = Math.max(8, Math.min(15, plaza.r - 8));
   const paths: [Point, Point][] = towerCenters.map((c) => [[plaza.x, plaza.y], c]);
 
+  // Lawn = everything inside the complex that is not a building margin, path or the playground.
+  // lawnEdge > 0 inside the lawn; its zero line runs parallel to the paths and facades.
+  const lawnEdge = (x: number, y: number) => {
+    if (!pointInPolygon(x, y, hull)) return -1;
+    let f = Math.min(distToOutline(x, y, hull) - 2.5, distToBuildings(x, y) - 6.5, Math.hypot(x - plaza.x, y - plaza.y) - (plazaR + 3.4));
+    for (const [a, b] of paths) f = Math.min(f, distToSegment(x, y, a[0], a[1], b[0], b[1]) - 2.1);
+    return f;
+  };
+
+  // planting positions, kept a little inside the lawn edge
   const lawnSpots: Point[] = [];
-  for (let x = cx - hx - courtMargin; x <= cx + hx + courtMargin; x += 4.2)
-    for (let y = cy - hy - courtMargin; y <= cy + hy + courtMargin; y += 4.2) {
+  for (let x = cx - hx; x <= cx + hx; x += 4.2)
+    for (let y = cy - hy; y <= cy + hy; y += 4.2) {
       const px = x + (rand() - 0.5) * 1.6;
       const py = y + (rand() - 0.5) * 1.6;
-      if (
-        !pointInPolygon(px, py, courtyard) ||
-        distToOutline(px, py, courtyard) < 5.5 ||
-        distToBuildings(px, py) < 7.5 ||
-        Math.hypot(px - plaza.x, py - plaza.y) < plazaR + 5 ||
-        paths.some(([a, b]) => distToSegment(px, py, a[0], a[1], b[0], b[1]) < 4.6)
-      )
-        continue;
-      lawnSpots.push([px, py]);
+      if (lawnEdge(px, py) > 1.6) lawnSpots.push([px, py]);
     }
 
   {
-    const disc = new THREE.CircleGeometry(3.9, 14);
-    disc.rotateX(-Math.PI / 2);
-    const lawns = new THREE.InstancedMesh(disc, matte(0x7fa765), lawnSpots.length);
-    const m = new THREE.Matrix4();
-    lawnSpots.forEach(([x, y], i) => lawns.setMatrixAt(i, m.makeTranslation(x, 0.33, -y)));
-    lawns.receiveShadow = true;
-    scene.add(lawns);
-
-    const tufts: GrassTuft[] = [];
-    for (const [x, y] of lawnSpots)
-      for (let i = 0; i < Math.round(40 * veg.grassDensity); i++) {
-        const a = rand() * Math.PI * 2;
-        const r = Math.sqrt(rand()) * 3.6;
-        tufts.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, h: 0.33, k: 0.8 + rand() * 0.6, tint: rand() });
+    // lawn mesh: marching squares over a 1 m grid, so the edges follow the paths instead of scalloping
+    const step = 1;
+    const cols = Math.ceil((2 * hx) / step) + 1;
+    const rows = Math.ceil((2 * hy) / step) + 1;
+    const x0 = cx - hx;
+    const y0 = cy - hy;
+    const field = new Float32Array(cols * rows);
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) field[r * cols + c] = lawnEdge(x0 + c * step, y0 + r * step);
+    const pos: number[] = [];
+    const corners: Point[] = [
+      [0, 0],
+      [1, 0],
+      [1, 1],
+      [0, 1],
+    ];
+    for (let r = 0; r < rows - 1; r++)
+      for (let c = 0; c < cols - 1; c++) {
+        const v = corners.map(([a, b]) => field[(r + b) * cols + c + a]);
+        if (v.every((q) => q <= 0)) continue;
+        const poly: Point[] = [];
+        for (let k = 0; k < 4; k++) {
+          const n = (k + 1) % 4;
+          const [ax, ay] = corners[k];
+          const [bx, by] = corners[n];
+          if (v[k] > 0) poly.push([ax, ay]);
+          if (v[k] > 0 !== v[n] > 0) {
+            const t = v[k] / (v[k] - v[n]);
+            poly.push([ax + (bx - ax) * t, ay + (by - ay) * t]);
+          }
+        }
+        for (let k = 1; k < poly.length - 1; k++)
+          for (const q of [poly[0], poly[k], poly[k + 1]]) pos.push(x0 + (c + q[0]) * step, 0.33, -(y0 + (r + q[1]) * step));
       }
-    veg.addGrass(scene, grass, tufts);
+    if (pos.length) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+      g.computeVertexNormals();
+      const lawns = new THREE.Mesh(worldUV(g), grassMaterial());
+      lawns.receiveShadow = true;
+      scene.add(lawns);
+    }
+
+    // light garden paths from the playground towards each building, and the walk round the playground
+    const walks: THREE.BufferGeometry[] = paths.map((p) => ribbonGeometry(p, 2.6, 0.318));
+    const round = new THREE.RingGeometry(plazaR, plazaR + 2.6, 48);
+    round.rotateX(-Math.PI / 2);
+    round.translate(plaza.x, 0.318, -plaza.y);
+    walks.push(round);
+    scene.add(mergedStaticMesh(walks, matte(0xd8d3c8), false));
 
     const floor = new THREE.Mesh(new THREE.CylinderGeometry(plazaR, plazaR, 0.06, 48), matte(0xdcc594));
     floor.position.copy(planToWorld(plaza.x, plaza.y, 0.34));
@@ -293,53 +332,6 @@ export function buildLandscape(
       });
     }
     plantTrees(trees, () => 0.33);
-  }
-
-  // meadow grass across the whole terrain (kept off roads and the courtyard)
-  {
-    const tufts: GrassTuft[] = [];
-    const target = Math.round(130000 * veg.grassDensity);
-    const roads: [Point[], boolean, number][] = [
-      [ringRoad, true, roadWidth / 2 + 3.6],
-      [avenue, false, (roadWidth + 3) / 2 + 1],
-      [westRoad, false, roadWidth / 2 + 1],
-      ...connectors.map((c): [Point[], boolean, number] => [c, false, roadWidth / 2 + 1]),
-    ];
-    const roadClearance = (x: number, y: number) =>
-      Math.min(...roads.map(([path, closed, half]) => distToOutline(x, y, path, closed) - half));
-
-    // coarse lookup grid so the exact distance only has to be computed near roads
-    const cell = 6;
-    const R = 430;
-    const x0 = cx - R - hx - cell;
-    const y0 = cy - R - hy - cell;
-    const cols = Math.ceil((2 * (R + hx) + 2 * cell) / cell);
-    const rows = Math.ceil((2 * (R + hy) + 2 * cell) / cell);
-    const grid = new Float32Array(cols * rows);
-    for (let r = 0; r < rows; r++)
-      for (let c = 0; c < cols; c++) grid[r * cols + c] = roadClearance(x0 + (c + 0.5) * cell, y0 + (r + 0.5) * cell);
-
-    for (let i = 0; i < target * 4 && tufts.length < target; i++) {
-      const a = rand() * Math.PI * 2;
-      const d = Math.pow(rand(), 0.75) * R;
-      const x = cx + Math.cos(a) * d * (1 + hx / R);
-      const y = cy + Math.sin(a) * d * (1 + hy / R);
-      if (
-        pointInPolygon(x, y, courtyard) ||
-        (grid[Math.floor((y - y0) / cell) * cols + Math.floor((x - x0) / cell)] < cell && roadClearance(x, y) < 0)
-      )
-        continue;
-      const far = Math.hypot(x - cx, y - cy) / R;
-      tufts.push({
-        x,
-        y,
-        h: terrainHeight(x, y) - 0.03,
-        k: 1.5 + far * 2.8 + rand() * 0.7,
-        ky: 1.3 + far * 0.9 + rand() * 0.5,
-        tint: rand(),
-      });
-    }
-    veg.addGrass(scene, grass, tufts, "far");
   }
 
   // street trees between the ring road and the avenue
