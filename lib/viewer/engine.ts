@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { FloorData, Point, SiteData, UnitData } from "../types";
 import { buildPodium, buildRoofGardens, buildTowers, UNIT_COLORS, type Block, type Unit } from "./buildings";
+import { addSky, effectsEnabled, makePipeline, type Pipeline } from "./effects";
 import { buildLandscape } from "./landscape";
 import { Vegetation } from "./vegetation";
 
@@ -29,7 +30,8 @@ export interface TooltipState {
 
 const OVERVIEW_TARGET = new THREE.Vector3(-35, 15, -42);
 const OVERVIEW_POSITION = new THREE.Vector3(70, 175, 240);
-const SKY = 0xdbe8f4;
+const SKY = 0xdbe8f4; // background when the sky effect is off
+const FOG = 0xcfdfee;
 
 /**
  * Three.js apartment viewer. Owns the scene and the interaction state; React subscribes
@@ -42,11 +44,14 @@ export class ApartmentViewer {
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
-  private readonly camera = new THREE.PerspectiveCamera(32, 1, 1, 2200);
+  // near plane kept far out: better depth precision on a large site
+  private readonly camera = new THREE.PerspectiveCamera(32, 1, 4, 2400);
   private readonly controls: OrbitControls;
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2();
   private readonly unitByData = new Map<UnitData, Unit>();
+  private readonly pipeline: Pipeline;
+  private disposeSky: (() => void) | null = null;
 
   private state: ViewerState;
   private hovered: Unit | null = null;
@@ -65,15 +70,16 @@ export class ApartmentViewer {
     site: SiteData,
   ) {
     // ---------- renderer / scene / camera ----------
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true });
+    const fx = effectsEnabled(); // sky, reflections and ambient occlusion (`?fx=0` turns them off)
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.toneMappingExposure = fx ? 1.0 : 1.05;
 
     this.scene.background = new THREE.Color(SKY);
-    this.scene.fog = new THREE.Fog(SKY, 600, 1700);
+    this.scene.fog = new THREE.Fog(FOG, 700, 2100);
 
     this.camera.position.copy(OVERVIEW_POSITION);
     this.controls = new OrbitControls(this.camera, canvas);
@@ -86,7 +92,8 @@ export class ApartmentViewer {
     this.controls.enablePan = false;
     this.controls.addEventListener("change", () => (this.needsRender = true));
 
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xb9c2cf, 1.15));
+    // with effects on, the sky environment supplies part of the ambient light
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xb9c2cf, fx ? 1.05 : 1.15));
     const sun = new THREE.DirectionalLight(0xfff4e0, 2.1);
     sun.position.set(40, 190, 60);
     sun.target.position.set(-35, 0, -45);
@@ -96,9 +103,14 @@ export class ApartmentViewer {
     Object.assign(sun.shadow.camera, { left: -240, right: 190, top: 220, bottom: -190, near: 10, far: 800 });
     sun.shadow.bias = -4e-4;
     this.scene.add(sun);
+    const sky = fx ? addSky(this.renderer, this.scene, sun) : null;
+    const env = sky ? sky.texture : null;
+    this.disposeSky = sky ? sky.dispose : null;
+    // redraw once textures have loaded
+    THREE.DefaultLoadingManager.onLoad = () => (this.needsRender = true);
 
     // ---------- content ----------
-    const { blocks, units } = buildTowers(site.blocks, site.windows || {});
+    const { blocks, units } = buildTowers(site.blocks, site.windows || {}, env);
     this.blocks = blocks;
     this.units = units;
     for (const b of blocks) this.scene.add(b.group);
@@ -107,15 +119,16 @@ export class ApartmentViewer {
     const podiums = site.podiums || [];
     const towerOutlines = site.blocks.flatMap((b) => b.outlines || []);
     for (const p of podiums)
-      this.scene.add(buildPodium(p, towerOutlines.concat(podiums.filter((o) => o !== p).map((o) => o.polygon))));
-    buildRoofGardens(this.scene, podiums, towerOutlines, site.grass, this.vegetation);
+      this.scene.add(buildPodium(p, towerOutlines.concat(podiums.filter((o) => o !== p).map((o) => o.polygon)), env));
+    buildRoofGardens(this.scene, podiums, towerOutlines, this.vegetation);
     buildLandscape(
       this.scene,
       towerOutlines.concat(podiums.map((p) => p.polygon)),
       blocks.map((b): Point => [b.center.x, -b.center.z]),
-      site.grass,
       this.vegetation,
     );
+
+    this.pipeline = makePipeline(this.renderer, this.scene, this.camera, fx);
 
     this.state = { block: blocks[0].id, rooms: null, floor: null, selected: null, plan: null, hintHidden: false };
 
@@ -239,9 +252,10 @@ export class ApartmentViewer {
       u.mesh.castShadow = !faded;
       u.edges.material.opacity = faded ? 0.04 : 0.35;
       if (u.glass) {
-        u.glass.material.color.copy(glass);
-        u.glass.material.opacity = opacity;
-        u.glass.material.depthWrite = !faded;
+        // panes are instances of the floor's pane mesh; its opacity is set with the rest of the floor below
+        const { mesh, start, count } = u.glass;
+        for (let i = 0; i < count; i++) mesh.setColorAt(start + i, glass);
+        mesh.instanceColor.needsUpdate = true;
       }
     }
     for (const b of this.blocks) {
@@ -348,6 +362,7 @@ export class ApartmentViewer {
     const w = this.canvas.clientWidth;
     const h = this.canvas.clientHeight;
     this.renderer.setSize(w, h, false);
+    this.pipeline.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.needsRender = true;
@@ -364,7 +379,9 @@ export class ApartmentViewer {
     }
     this.controls.update();
     if (this.needsRender) {
-      this.renderer.render(this.scene, this.camera);
+      // an isolated floor is shown among faded ones: no occlusion from those
+      this.pipeline.setAO(this.state.floor == null);
+      this.pipeline.render();
       this.needsRender = false;
     }
     this.frame = requestAnimationFrame(this.loop);
@@ -386,6 +403,9 @@ export class ApartmentViewer {
       if (m.material) (Array.isArray(m.material) ? m.material : [m.material]).forEach((x) => materials.add(x));
     });
     materials.forEach((m) => m.dispose());
+    this.pipeline.dispose();
+    this.disposeSky?.();
+    THREE.DefaultLoadingManager.onLoad = () => {};
     this.renderer.dispose();
     this.listeners.clear();
     this.tooltipListeners.clear();

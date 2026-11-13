@@ -72,17 +72,10 @@ export interface WindowType {
   door: boolean;
 }
 
-export interface GrassData {
-  height: number;
-  variants: number[][];
-  far: number[][];
-}
-
 export interface SiteData {
   project: string;
   note?: string;
   blocks: SiteBlock[];
   podiums?: Podium[];
-  grass?: GrassData;
   windows?: Record<string, WindowType>;
 }
