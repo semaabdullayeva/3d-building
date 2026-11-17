@@ -9,12 +9,19 @@ export function Tooltip({ viewer }: { viewer: ApartmentViewer }) {
   const tip = useSyncExternalStore(viewer.subscribeTooltip, viewer.getTooltip, () => null);
   if (!tip) return null;
   const { unit, x, y } = tip;
+  const status = viewer.statusOf(unit);
   return (
     <div className="tooltip" style={{ left: x, top: y }}>
       <b>
         {unit.data.type} · {formatArea(unit.data.areaTotal)} {t.m2}
       </b>
       {t.block(unit.block.label)} · {t.floor} {unit.floor.floor} · {t.rooms(unit.data.rooms)}
+      {status && (
+        <span className="tooltip-status">
+          <span className={`status-swatch status-swatch--${status}`} aria-hidden="true" />
+          {t.status[status]}
+        </span>
+      )}
     </div>
   );
 }

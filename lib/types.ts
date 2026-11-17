@@ -3,6 +3,13 @@
 export type Point = [number, number];
 export type Polygon = Point[];
 
+export type SaleStatus = "available" | "reserved" | "sold";
+
+/** public/data/sales.json — sale status per unit id. */
+export interface SalesData {
+  statuses: Record<string, SaleStatus>;
+}
+
 export interface UnitData {
   id: string;
   type: string;

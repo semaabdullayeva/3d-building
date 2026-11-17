@@ -10,23 +10,47 @@ import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 
 export const effectsEnabled = () => new URLSearchParams(globalThis.location?.search || "").get("fx") !== "0";
 
+/** Atmospheric sky with an extra `uNight` blend towards a dark blue, starry night sky. */
 function makeSky(sunDirection: THREE.Vector3) {
   const sky = new Sky();
   sky.scale.setScalar(10000);
-  const u = sky.material.uniforms;
+  const m = sky.material;
+  const u = m.uniforms;
   u.turbidity.value = 3.2;
   u.rayleigh.value = 0.9;
   u.mieCoefficient.value = 0.004;
   u.mieDirectionalG.value = 0.82;
   u.sunPosition.value.copy(sunDirection);
+  u.uNight = { value: 0 };
+  m.fragmentShader = m.fragmentShader
+    .replace("uniform vec3 up;", "uniform vec3 up;\nuniform float uNight;")
+    .replace(
+      "gl_FragColor = vec4( retColor, 1.0 );",
+      `float nh = clamp( direction.y * 2.2, 0.0, 1.0 );
+      vec3 night = mix( vec3( 0.075, 0.1, 0.17 ), vec3( 0.012, 0.02, 0.05 ), nh );
+      vec3 sd = floor( direction * 420.0 );
+      float star = step( 0.9975, fract( sin( dot( sd, vec3( 12.9898, 78.233, 37.719 ) ) ) * 43758.5453 ) );
+      night += star * smoothstep( 0.05, 0.3, direction.y ) * vec3( 0.75, 0.78, 0.9 );
+      gl_FragColor = vec4( mix( retColor, night, uNight ), 1.0 );`,
+    );
   return sky;
+}
+
+export interface SkyHandle {
+  /** current environment texture (replaced on every `update`) */
+  texture: THREE.Texture;
+  /** moves the sun in the sky dome; `night` 0..1 darkens it towards the night sky */
+  setSun(direction: THREE.Vector3, night: number): void;
+  /** re-renders the reflection environment from the current sky; returns the new texture */
+  refreshEnvironment(): { previous: THREE.Texture; texture: THREE.Texture };
+  dispose(): void;
 }
 
 /**
  * Adds the sky dome and an environment map made from it (PMREMGenerator), so that glass and other
- * smooth surfaces reflect the sky. Returns the environment texture.
+ * smooth surfaces reflect the sky.
  */
-export function addSky(renderer: THREE.WebGLRenderer, scene: THREE.Scene, sun: THREE.DirectionalLight) {
+export function addSky(renderer: THREE.WebGLRenderer, scene: THREE.Scene, sun: THREE.DirectionalLight): SkyHandle {
   const dir = sun.position.clone().sub(sun.target.position).normalize();
   const sky = makeSky(dir);
   sky.userData.noAO = true;
@@ -35,17 +59,48 @@ export function addSky(renderer: THREE.WebGLRenderer, scene: THREE.Scene, sun: T
   // environment: the same sky above and a light grey-blue floor below, standing in for the surroundings
   // that windows reflect when seen from above (a dark floor would turn them black)
   const env = new THREE.Scene();
-  env.add(makeSky(dir));
-  const ground = new THREE.Mesh(new THREE.CircleGeometry(4000, 32), new THREE.MeshBasicMaterial({ color: 0x9aa7ad }));
+  const envSky = makeSky(dir);
+  env.add(envSky);
+  const groundMat = new THREE.MeshBasicMaterial({ color: 0x9aa7ad });
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(4000, 32), groundMat);
   ground.rotation.x = -Math.PI / 2;
   ground.position.y = -12;
   env.add(ground);
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  const target = pmrem.fromScene(env, 0.02);
+  const dayGround = new THREE.Color(0x9aa7ad);
+  const nightGround = new THREE.Color(0x1c2330);
+
+  const render = () => {
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const t = pmrem.fromScene(env, 0.02);
+    pmrem.dispose();
+    return t;
+  };
+  let target = render();
   scene.environment = target.texture;
   scene.environmentIntensity = 0.1; // ambient light from the sky; glass uses the map directly at full strength
-  pmrem.dispose();
-  return { texture: target.texture, dispose: () => target.dispose() };
+
+  return {
+    get texture() {
+      return target.texture;
+    },
+    setSun(direction, night) {
+      for (const s of [sky, envSky]) {
+        s.material.uniforms.sunPosition.value.copy(direction);
+        s.material.uniforms.uNight.value = night;
+      }
+      groundMat.color.copy(dayGround).lerp(nightGround, night);
+    },
+    refreshEnvironment() {
+      const old = target;
+      target = render();
+      scene.environment = target.texture;
+      const previous = old.texture;
+      // the caller swaps materials over before the old one goes
+      queueMicrotask(() => old.dispose());
+      return { previous, texture: target.texture };
+    },
+    dispose: () => target.dispose(),
+  };
 }
 
 export interface Pipeline {

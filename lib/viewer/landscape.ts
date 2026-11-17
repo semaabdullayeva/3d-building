@@ -12,9 +12,12 @@ import {
   planToWorld,
   pointInPolygon,
   ribbonGeometry,
+  signedArea,
   smoothPath,
 } from "./geometry";
+import { addParkLamps, buildStreets, runs } from "./streets";
 import type { TreeInstance, Vegetation } from "./vegetation";
+import { addCats, addPeople, type Placement } from "./people";
 import { grassMaterial, worldUV } from "./ground";
 
 type SiteTree = { x: number; y: number; kind: "round" | "cypress" | "bush" | "palm"; k: number; tint: number };
@@ -135,7 +138,12 @@ export function buildLandscape(
   scene.add(mergedStaticMesh(asphalt, matte(0x47494e), false));
 
   const sidewalk = smoothPath(offsetPolygon(hull, courtMargin + 1.2 + roadWidth + 1.3), true);
-  scene.add(mergedStaticMesh([ribbonGeometry(sidewalk.concat([sidewalk[0], sidewalk[1]]), 2.2, 0.16)], matte(0xcfccc4), false));
+  // the ring sidewalk stops where the connectors and the west road leave the ring (zebra crossings go there)
+  const joinsRing = (x: number, y: number) =>
+    [...connectors, westRoad].some((r) => distToOutline(x, y, r, false) < roadWidth / 2 + 0.2);
+  scene.add(
+    mergedStaticMesh(runs(sidewalk.concat([sidewalk[0]]), joinsRing).map((r) => ribbonGeometry(r, 2.2, 0.16)), matte(0xcfccc4), false),
+  );
 
   // light sidewalk rim around the complex; inside it the ground between the buildings is asphalt
   const pad = new THREE.Mesh(extrudePolygon(courtyard, 0, 0.3), matte(0xd8d3c8));
@@ -166,6 +174,25 @@ export function buildLandscape(
     addDashes(avenue);
     addDashes(westRoad);
     scene.add(mergedStaticMesh(dashes, matte(0xf3f3ee), false));
+  }
+
+  // ---------- kerbs, edge lines, sidewalks, crossings, street lights, benches ----------
+  {
+    const outerSide = signedArea(ringRoad) > 0 ? -1 : 1; // on a counter-clockwise ring the left normal points inward
+    const avenueWidth = roadWidth + 3;
+    buildStreets(
+      scene,
+      [
+        { path: ringRoad, width: roadWidth, closed: true, sidewalks: false, lightSide: outerSide },
+        { path: avenue, width: avenueWidth, closed: false, sidewalks: true, lightSide: 0 },
+        { path: westRoad, width: roadWidth, closed: false, sidewalks: true, lightSide: 1 },
+        ...connectors.map((c) => ({ path: c, width: roadWidth, closed: false, sidewalks: false, lightSide: 0 as const })),
+      ],
+      connectors.flatMap((c) => [
+        { p: [c[0][0], ringSouth - roadWidth / 2 - 1.3] as Point, dir: [0, 1] as Point, width: roadWidth },
+        { p: [c[0][0], avenueY + avenueWidth / 2 + 1.35] as Point, dir: [0, 1] as Point, width: roadWidth },
+      ]),
+    );
   }
 
   // ---------- courtyard: plaza at the most open spot, lawns, paths to towers ----------
@@ -364,6 +391,116 @@ export function buildLandscape(
       trees.push({ x, y, kind: rand() < 0.55 ? "cypress" : "round", k: 0.9 + rand() * 0.9, tint: rand() });
     }
     plantTrees(trees, terrainHeight, true);
+  }
+
+  // ---------- people and cats: on the sidewalk, garden paths, round the playground and by the entrances ----------
+  {
+    const people: Placement[] = [];
+    const cats: Placement[] = [];
+    const clear = (x: number, y: number, d = 1.4) =>
+      !people.some((p) => Math.hypot(p.x - x, p.y - y) < d) && !cats.some((c) => Math.hypot(c.x - x, c.y - y) < d);
+    const adult = () => 0.92 + rand() * 0.16;
+    const walker = (x: number, y: number, h: number, dir: number) =>
+      people.push({ x, y, h, heading: dir + (rand() < 0.5 ? 0 : Math.PI) + (rand() - 0.5) * 0.3, scale: adult() });
+    // a few people standing in a circle, facing each other
+    const group = (x: number, y: number, h: number, n: number) => {
+      const a0 = rand() * Math.PI * 2;
+      for (let i = 0; i < n; i++) {
+        const a = a0 + (i / n) * Math.PI * 2;
+        people.push({ x: x + Math.cos(a) * 0.55, y: y + Math.sin(a) * 0.55, h, heading: a + Math.PI, scale: adult() });
+      }
+    };
+    const onSegment = (a: Point, b: Point, t: number, side: number): [number, number, number] => {
+      const dir = Math.atan2(b[1] - a[1], b[0] - a[0]);
+      return [a[0] + (b[0] - a[0]) * t - Math.sin(dir) * side, a[1] + (b[1] - a[1]) * t + Math.cos(dir) * side, dir];
+    };
+
+    // sidewalk round the complex
+    for (let n = 0; n < 40; n++) {
+      const i = Math.floor(rand() * (sidewalk.length - 1));
+      const [x, y, dir] = onSegment(sidewalk[i], sidewalk[i + 1], rand(), (rand() - 0.5) * 1.2);
+      if (!clear(x, y, 3)) continue;
+      if (rand() < 0.2) group(x, y, 0.16, 2);
+      else walker(x, y, 0.16, dir);
+    }
+    // garden paths from the playground to the towers
+    for (const [a, b] of paths)
+      for (let n = 0; n < 3; n++) {
+        const [x, y, dir] = onSegment(a, b, 0.15 + rand() * 0.7, (rand() - 0.5) * 1.2);
+        if (distToBuildings(x, y) < 3 || Math.hypot(x - plaza.x, y - plaza.y) < plazaR + 3 || !clear(x, y, 2.5)) continue;
+        if (rand() < 0.25) group(x, y, 0.318, 2);
+        else walker(x, y, 0.318, dir);
+      }
+    // parents round the playground watching, children on it
+    for (let n = 0; n < 12; n++) {
+      const a = rand() * Math.PI * 2;
+      const x = plaza.x + Math.cos(a) * (plazaR + 1.3);
+      const y = plaza.y + Math.sin(a) * (plazaR + 1.3);
+      if (clear(x, y, 2)) people.push({ x, y, h: 0.318, heading: a + Math.PI + (rand() - 0.5) * 0.8, scale: adult() });
+    }
+    for (let n = 0; n < 10; n++) {
+      const a = rand() * Math.PI * 2;
+      const r = plazaR * (0.3 + rand() * 0.55);
+      const x = plaza.x + Math.cos(a) * r;
+      const y = plaza.y + Math.sin(a) * r;
+      if (clear(x, y, 1.6)) people.push({ x, y, h: 0.37, heading: rand() * Math.PI * 2, scale: 0.55 + rand() * 0.15 });
+    }
+    // by the building entrances on the courtyard paving
+    for (let n = 0; n < 400 && people.length < 115; n++) {
+      const x = cx + (rand() - 0.5) * 2 * hx;
+      const y = cy + (rand() - 0.5) * 2 * hy;
+      const d = distToBuildings(x, y);
+      if (d < 2.5 || d > 5 || lawnEdge(x, y) > -0.5 || !pointInPolygon(x, y, hull) || !clear(x, y, 6)) continue;
+      if (rand() < 0.35) group(x, y, 0.312, 2 + Math.floor(rand() * 2));
+      else people.push({ x, y, h: 0.312, heading: rand() * Math.PI * 2, scale: adult() });
+    }
+
+    // cats on the lawns, a couple on the paths
+    for (let n = 0; n < 80 && cats.length < 12; n++) {
+      const [sx, sy] = lawnSpots[Math.floor(rand() * lawnSpots.length)] ?? [cx, cy];
+      // planting spots may hold a tree: sit beside it, still on the lawn
+      const a = rand() * Math.PI * 2;
+      const x = sx + Math.cos(a) * (1.2 + rand());
+      const y = sy + Math.sin(a) * (1.2 + rand());
+      if (lawnEdge(x, y) > 0.6 && clear(x, y, 4)) cats.push({ x, y, h: 0.33, heading: rand() * Math.PI * 2, scale: 0.9 + rand() * 0.25 });
+    }
+    for (let n = 0; n < 20 && cats.length < 16; n++) {
+      const i = Math.floor(rand() * (sidewalk.length - 1));
+      const [x, y, dir] = onSegment(sidewalk[i], sidewalk[i + 1], rand(), (rand() - 0.5) * 1.4);
+      if (clear(x, y, 3)) cats.push({ x, y, h: 0.16, heading: dir + (rand() - 0.5) * 0.8, scale: 0.9 + rand() * 0.25 });
+    }
+
+    addPeople(scene, people, rand);
+    addCats(scene, cats, rand);
+  }
+
+  // ---------- courtyard lights: along the garden paths and round the playground ----------
+  {
+    const lamps: Point[] = [];
+    const nearPath = (x: number, y: number, r: number) =>
+      paths.some(([a, b]) => distToSegment(x, y, a[0], a[1], b[0], b[1]) < r);
+    for (const [a, b] of paths) {
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (len < 1) continue;
+      const ux = (b[0] - a[0]) / len;
+      const uy = (b[1] - a[1]) / len;
+      let side = 1;
+      for (let s = plazaR + 7; s < len - 4; s += 9, side = -side) {
+        const x = a[0] + ux * s - uy * 1.7 * side;
+        const y = a[1] + uy * s + ux * 1.7 * side;
+        if (distToBuildings(x, y) < 3 || !pointInPolygon(x, y, hull)) continue;
+        lamps.push([x, y]);
+      }
+    }
+    const ring = 8;
+    for (let k = 0; k < ring; k++) {
+      const ang = (k / ring) * Math.PI * 2 + 0.2;
+      const x = plaza.x + Math.cos(ang) * (plazaR + 3.2);
+      const y = plaza.y + Math.sin(ang) * (plazaR + 3.2);
+      if (nearPath(x, y, 2.2) || distToBuildings(x, y) < 3) continue;
+      lamps.push([x, y]);
+    }
+    addParkLamps(scene, lamps, 0.33);
   }
 }
 

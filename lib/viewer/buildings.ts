@@ -38,12 +38,87 @@ export const UNIT_COLORS = {
   unit: new THREE.Color(PALETTE.wall),
   unitTop: new THREE.Color(PALETTE.wallTop),
   glass: new THREE.Color(PALETTE.glass),
-  dim: new THREE.Color(0xcfd2d6),
+  dim: new THREE.Color(0xb9bec4),
   dimGlass: new THREE.Color(0xaeb4bb),
-  match: new THREE.Color(0x8fb0ff),
-  hover: new THREE.Color(0x4f7dff),
-  selected: new THREE.Color(0x2456e6),
+  match: new THREE.Color(0xb7e78d),
+  hover: new THREE.Color(0x8cc152),
+  selected: new THREE.Color(0x6ba43a),
+  status: {
+    available: new THREE.Color(0xf4f2ec),
+    reserved: new THREE.Color(0xe0a020),
+    sold: new THREE.Color(0x173a5e),
+  },
 };
+
+const overlayMat = (color: number, opacity: number) =>
+  new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthWrite: false });
+
+/** Shared materials for the facade overlays, one per highlight kind. */
+export const UNIT_OVERLAYS = {
+  selected: overlayMat(0x6ba43a, 0.6),
+  hover: overlayMat(0x8cc152, 0.5),
+  match: overlayMat(0xb7e78d, 0.45),
+  available: overlayMat(0xffffff, 0.6),
+  reserved: overlayMat(0xe0a020, 0.65),
+  sold: overlayMat(0x173a5e, 0.72),
+};
+
+/**
+ * Translucent boxes in front of every outward-facing edge of a unit, reaching past the floor plate's edge,
+ * so a highlight covers the facade frame, slab edge and balcony that belong to the apartment.
+ */
+function unitShell(poly: Polygon, others: Polygon[], outline: Polygon, level: number, height: number) {
+  const parts: THREE.BufferGeometry[] = [];
+  const cy = level + height / 2;
+  const h = height - 0.04;
+  const boxed = others.map((p) => {
+    const xs = p.map((q) => q[0]);
+    const ys = p.map((q) => q[1]);
+    return { p, x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+  });
+  const blocked = (x: number, y: number) =>
+    boxed.some((o) => x >= o.x0 && x <= o.x1 && y >= o.y0 && y <= o.y1 && pointInPolygon(x, y, o.p));
+  for (let i = 0; i < poly.length; i++) {
+    const [ax, ay] = poly[i];
+    const [bx, by] = poly[(i + 1) % poly.length];
+    const len = Math.hypot(bx - ax, by - ay);
+    if (len < 0.3) continue;
+    const ux = (bx - ax) / len;
+    const uy = (by - ay) / len;
+    let nx = uy;
+    let ny = -ux;
+    if (pointInPolygon((ax + bx) / 2 + nx * 0.05, (ay + by) / 2 + ny * 0.05, poly)) {
+      nx = -nx;
+      ny = -ny;
+    }
+    const angle = Math.atan2(uy, ux);
+    const n = Math.max(1, Math.round(len / 0.9));
+    const step = len / n;
+    for (let k = 0; k < n; k++) {
+      const x = ax + ux * step * (k + 0.5);
+      const y = ay + uy * step * (k + 0.5);
+      // walk outward to the plate edge; edges that run into a neighbour or deep into the building are inner walls
+      let t = 0.1;
+      let inner = false;
+      while (pointInPolygon(x + nx * t, y + ny * t, outline)) {
+        if (t > 2.4 || blocked(x + nx * t, y + ny * t)) {
+          inner = true;
+          break;
+        }
+        t += 0.15;
+      }
+      if (inner) continue;
+      const d = t + 0.6;
+      parts.push(facadeBox(x, y, nx, ny, angle, step + 0.02, h, d, cy, d / 2));
+    }
+  }
+  const mesh = mergedMesh(parts, UNIT_OVERLAYS.selected);
+  if (mesh) {
+    mesh.visible = false;
+    mesh.renderOrder = 3;
+  }
+  return mesh;
+}
 
 const SLAB_THICKNESS = 0.3;
 /** Tip-1 towers: floors from here up use the darker "top" colour and taller glazing. */
@@ -55,6 +130,8 @@ export interface Unit {
   block: Block;
   mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
   edges: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>;
+  /** translucent volume over the unit's outward facade (frame, slab edge, balcony); shown while highlighted */
+  overlay: THREE.Mesh<THREE.BufferGeometry, THREE.Material> | null;
   /** this apartment's panes: a range of instances in the floor's pane mesh (tinted by instance colour) */
   glass: { mesh: THREE.InstancedMesh; start: number; count: number } | null;
   isTop: boolean;
@@ -74,9 +151,31 @@ export interface Block {
   shell: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>[];
   center: THREE.Vector3;
   windows?: { floor: number; unit: string; x: number; y: number; ux: number; uy: number; w: number }[];
+  /** per floor: warm night light behind the panes (see WindowGlow) */
+  glows: WindowGlow[];
   /** instance counts, for debugging */
   paneCount: number;
   barCount: number;
+}
+
+/**
+ * Lit windows at night: additive boxes over a floor's panes. Each pane belongs to an apartment whose
+ * `seed` (0..1) decides how late its lights come on; `tint` is the pane's lamp colour (rgb triples).
+ */
+export interface WindowGlow {
+  mesh: THREE.InstancedMesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>;
+  floor: number;
+  seed: Float32Array;
+  tint: Float32Array;
+}
+
+const WARM_TINTS = [0xffd28a, 0xffe2ad, 0xfff0d2, 0xffc078, 0xffe8c0].map((c) => new THREE.Color(c));
+
+/** Stable 0..1 value from a string (FNV-1a). */
+function hash01(s: string) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return ((h >>> 0) % 100000) / 100000;
 }
 
 type StdMesh = THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
@@ -124,6 +223,7 @@ export function buildTower(
     floorGroups: new Map(),
     shell: [],
     center: new THREE.Vector3(px, 27, -py),
+    glows: [],
     paneCount: 0,
     barCount: 0,
   };
@@ -347,7 +447,9 @@ export function buildTower(
           },
         );
       }
-      const unit: Unit = { data: ud, floor: fl, block, mesh, edges, glass: null, isTop, pending: !!ud.pending };
+      const overlay = unitShell(ud.polygon, occluders.filter((p) => p !== ud.polygon), outline, fl.level, fl.height);
+      if (overlay) fg.add(overlay);
+      const unit: Unit = { data: ud, floor: fl, block, mesh, edges, overlay, glass: null, isTop, pending: !!ud.pending };
       if (glass.length) paneOwners.push({ unit, start: panes.length, count: glass.length });
       panes.push(...glass);
       mesh.userData.unit = unit;
@@ -369,6 +471,29 @@ export function buildTower(
       fg.add(paneMesh);
       slabs.push(paneMesh);
       block.paneCount += panes.length;
+
+      // night: the same panes, a little smaller and deeper, glowing over the glass
+      const inset = new THREE.Matrix4().makeScale(0.92, 0.9, 1.7);
+      const glow = instancedBoxes(
+        panes.map((m) => m.clone().multiply(inset)),
+        new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
+      );
+      const seed = new Float32Array(panes.length);
+      const tint = new Float32Array(panes.length * 3);
+      for (const o of paneOwners) {
+        const s = hash01(o.unit.data.id + "/" + fl.floor);
+        const c = WARM_TINTS[Math.floor(hash01(o.unit.data.id + "#") * WARM_TINTS.length)];
+        for (let i = o.start; i < o.start + o.count; i++) {
+          seed[i] = s;
+          c.toArray(tint, i * 3);
+        }
+      }
+      for (let i = 0; i < panes.length; i++) glow.setColorAt(i, new THREE.Color(0, 0, 0));
+      glow.visible = false;
+      glow.userData.noAO = true;
+      glow.renderOrder = 3;
+      fg.add(glow);
+      block.glows.push({ mesh: glow, floor: fl.floor, seed, tint });
     }
     if (frames.length) {
       const frameMesh = instancedBoxes(frames, materials.windowFrame.clone());

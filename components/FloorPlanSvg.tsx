@@ -3,6 +3,7 @@
 import type { FloorData, Polygon, UnitData } from "@/lib/types";
 import { formatArea, t } from "@/lib/i18n";
 import { centroid } from "@/lib/viewer/geometry";
+import { FloorPlanDrawing, floorLayouts } from "./FloorPlanDrawing";
 
 // SVG y axis points down, plan y points north.
 const points = (poly: Polygon) => poly.map(([x, y]) => `${x},${-y}`).join(" ");
@@ -18,6 +19,19 @@ interface Props {
 }
 
 export function FloorPlanSvg({ floor, image, className, isSelected, isDimmed, onSelect }: Props) {
+  const vector = image ? floorLayouts(floor) : null;
+  if (vector) {
+    return (
+      <FloorPlanDrawing
+        floor={floor}
+        matches={vector}
+        className={className}
+        isSelected={isSelected}
+        isDimmed={isDimmed}
+        onSelect={onSelect}
+      />
+    );
+  }
   const withImage = image && !!floor.plan;
   let [x0, y0, x1, y1] = floor.plan?.bounds ?? [0, 0, 0, 0];
   if (!withImage) {

@@ -1,20 +1,20 @@
 "use client";
 
 import { t } from "@/lib/i18n";
-import type { Block } from "@/lib/viewer/engine";
+import type { Block, Unit } from "@/lib/viewer/engine";
 
 interface Props {
   block: Block;
   floor: number | null;
-  rooms: number | null;
+  matches: (u: Unit) => boolean;
   onFloor: (floor: number | null) => void;
 }
 
 /** Vertical floor picker, top floor first. Floors without apartments (podium) are disabled. */
-export function FloorNav({ block, floor, rooms, onFloor }: Props) {
+export function FloorNav({ block, floor, matches, onFloor }: Props) {
   const numbers = Array.from({ length: block.data.floorsTotal }, (_, i) => block.data.floorsTotal - i);
   return (
-    <nav className="floors" aria-label="Floors">
+    <nav className="floors glass" aria-label={t.floors}>
       <div className="floors-label">{t.floors}</div>
       {numbers.map((n) => {
         const f = block.data.floors.find((x) => x.floor === n);
@@ -24,7 +24,7 @@ export function FloorNav({ block, floor, rooms, onFloor }: Props) {
               {n}
             </button>
           );
-        const faint = f.pending || (rooms != null && !f.units.some((u) => u.rooms === rooms));
+        const faint = f.pending || !block.units.some((u) => u.floor === f && matches(u));
         return (
           <button
             key={n}
