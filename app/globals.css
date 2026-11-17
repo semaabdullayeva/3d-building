@@ -280,8 +280,44 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--ring); }
   .apt-card { left: auto; right: 84px; top: 74px; max-height: calc(100% - 90px); width: min(400px, calc(100% - 340px - 116px)); }
 }
 @media (max-width: 760px) {
-  .finder { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-height: 58vh; border-radius: 16px 16px 0 0; }
-  .finder-head { padding: 16px 20px; }
+  /* bottom sheet: filters and list scroll together, the title stays on top */
+  .finder { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-height: 66vh; max-height: 66dvh;
+    border-radius: 18px 18px 0 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
+  .finder::-webkit-scrollbar { display: none; }
+  .finder-head { position: sticky; top: 0; z-index: 1; padding: 14px 18px 12px; background: rgba(255, 255, 255, 0.94);
+    border-bottom: 1px solid var(--glass-line); }
+  .finder-head::before { content: ""; position: absolute; top: 6px; left: 50%; width: 36px; height: 4px; margin-left: -18px;
+    border-radius: 4px; background: var(--glass-line); }
+  .finder--closed .finder-head { border-bottom: 0; }
+  .finder-filters { gap: 12px; padding: 12px 16px; }
+  .finder-group .glass-label { margin-bottom: 6px; }
+  .finder-group .chip-row { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin: 0 -16px; padding: 0 16px; }
+  .finder-group .chip-row::-webkit-scrollbar { display: none; }
+  .chip { flex: none; }
+  .status-list { flex-direction: row; gap: 6px; }
+  .status-toggle { flex: 1; min-width: 0; grid-template-columns: 14px auto auto; justify-content: center; gap: 6px;
+    padding: 7px 6px; border-color: var(--glass-control-edge); border-radius: 32px; font-size: 12px; }
+  .status-toggle .status-swatch { width: 12px; height: 12px; }
+  .finder-list { flex: none; overflow: visible; padding: 10px 12px calc(14px + env(safe-area-inset-bottom)); }
+  .unit-row { grid-template-columns: 84px 1fr auto; gap: 10px; padding: 10px 12px; }
+  .unit-row-area { font-size: 16px; }
+  /* the floor rail stays above the open sheet */
+  #app:has(.finder:not(.finder--closed)) .floors { max-height: calc(34vh - 84px); max-height: calc(34dvh - 84px); }
+  /* selected apartment: a shorter sheet so the building stays in view; it replaces the finder sheet */
+  #app:has(.apt-card) .finder { display: none; }
+  .apt-card { gap: 12px; padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); max-height: 64vh; max-height: 64dvh; }
+  .apt-card-head { padding-bottom: 10px; }
+  .site-panel.apt-card .apt-title { font-size: 22px; }
+  .site-panel.apt-card .status-pill { margin-top: 6px; }
+  .apt-card-plan { flex: none; height: 30vh; height: 30dvh; aspect-ratio: auto; padding: 10px; }
+  .apt-card-facts { column-gap: 14px; }
+  .apt-card-facts > div { padding: 8px 0; }
+  .apt-card-facts dt { font-size: 11.5px; }
+  .apt-card-facts dd { font-size: 13px; }
+  .sun-panel { top: 66px; bottom: auto; left: 12px; right: 74px; padding: 12px 14px 8px; border-radius: 18px; }
+  .sun-time strong { font-size: 24px; }
+  .sun-mark { font-size: 8.5px; }
+  .sun-mark b { font-size: 10px; }
   .plan-peek { display: none; }
   .glass-title { font-size: 20px; }
   .apt-card { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-height: 78vh; z-index: 3; border-radius: 16px 16px 0 0; }
